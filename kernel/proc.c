@@ -295,6 +295,9 @@ fork(void)
 
   np->state = RUNNABLE;
 
+  // child has the same tracemask as its parent
+  np->tracemask = p->tracemask;
+
   release(&np->lock);
 
   return pid;
@@ -692,4 +695,16 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// get the number of activate processes
+uint64 num_actproc(void) {
+  uint64 num = 0;
+  struct proc *p;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    if (p->state != UNUSED) {
+      ++num;
+    }
+  }
+  return num;
 }
