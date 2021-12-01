@@ -77,10 +77,39 @@ sys_sleep(void)
 
 
 #ifdef LAB_PGTBL
+extern pte_t *walk(pagetable_t, uint64, int);
 int
 sys_pgaccess(void)
 {
   // lab pgtbl: your code here.
+  static char kbuf[512]; // 4096 / 8
+  memset(kbuf, 0, 512);
+
+  uint64 va, ubuf, currva;
+  int npages;
+  char *bufptr;
+  uint8 bitnum;
+  struct proc *p = myproc();
+
+  if (argaddr(0, &va) < 0 || argint(1, &npages) < 0 || argaddr(2, &ubuf) < 0)
+    return -1;
+  
+  // the upper limit on the number of pages that can be scanned
+  // the actural limit is about 20000 pages.
+  if (npages > 4096) return -1;
+
+  // for all virtual pages
+  for (int pidx = 0; pidx < npages; ++pidx) {
+    currva = va + pidx * PGSIZE;
+    pte_t *pte = walk(p->pagetable, currva, 0);
+    if ((PTE_FLAGS(*pte) & PTE_A) != 0) {
+      bufptr = (char *)kbuf + pidx / 8;
+      bitnum = ((uint8)1) << (pidx % 8);
+      *bufptr = (uint8)(*bufptr) | (char)bitnum;
+    }
+    *pte = *pte & (~PTE_A); // clear PTE_A after checking if it is set
+  }
+  copyout(p->pagetable, ubuf, (char *)kbuf, (npages - 1) / 8 + 1);
   return 0;
 }
 #endif

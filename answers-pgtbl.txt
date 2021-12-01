@@ -1,0 +1,21 @@
+1. Which other xv6 system call(s) could be made 
+   faster using this shared page? Explain how.
+A. fstat and stat that need copyout.
+
+2. Explain the output of vmprint in terms of Fig 3-4
+   from the text. What does page 0 contain? What is in
+   page 2? When running in user mode, could the process
+   read/write the memory mapped by page 1? What does the
+   third to last page contain?
+A. 
+   - Page 0: The code and data of the program.
+   - Page 1: Guard page, cannot be read/write by user.
+   - Page 2: User stack
+   - Past three pages:
+      - [-1]: Trampoline page
+      - [-2]: Trapframe
+      - [-3]: Usyscall page
+
+   Page 0 - 2 are allocated in exec function.
+   Page 0 of the first user process is allocated in uvminit.
+   The last three pages are allocated in proc_pagetable.

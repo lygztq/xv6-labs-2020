@@ -432,3 +432,28 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
+
+static void printpgtbl(char *prefix, pagetable_t tbl) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = tbl[i];
+    if ((pte & PTE_V) == 0) continue;
+    printf("%s%d: pte %p pa %p\n", prefix, i, (uint64)pte, (uint64)PTE2PA(pte));
+    if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // this PTE points to a lower-level page table
+      uint64 child = PTE2PA(pte);
+      prefix = prefix - 3;
+      printpgtbl(prefix, (pagetable_t)child);
+      prefix = prefix + 3;
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+
+  static char prefix_buf[12];
+  safestrcpy(prefix_buf, ".. .. ..", sizeof(prefix_buf));
+  char *prefix = prefix_buf + strlen(prefix_buf) - 2;
+
+  printpgtbl(prefix, pagetable);
+}
