@@ -57,6 +57,7 @@ sys_sleep(void)
 {
   int n;
   uint ticks0;
+  backtrace();
 
   if(argint(0, &n) < 0)
     return -1;
@@ -94,4 +95,30 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int ticks;
+  uint64 fnptr;
+  struct proc *p = myproc();
+
+  if (argint(0, &(ticks)) < 0 || argaddr(1, &fnptr) < 0) {
+    return -1;
+  }
+
+  p->alarminterval = ticks;
+  p->alarmfn = fnptr;
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  intr_off(); // to avoid timer interrupt here since we are modifying something like a lock (alarmticks)
+  struct proc *p = myproc();
+  memmove(p->trapframe, p->alarmframecopy, PGSIZE);
+  p->alarmticks = 0;
+  return 0;
 }
