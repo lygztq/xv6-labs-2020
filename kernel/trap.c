@@ -67,12 +67,63 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (r_scause() == 15) {
+    // write page fault
+    uint64 va = r_stval();
+    if (!validva(va)) {
+      // printf("usertrap(): invalid virtual address\n");
+      p->killed = 1;
+      goto kill;
+    }
+    uint64 vpa = PGROUNDDOWN(va), ppa = 0;
+    pte_t* pte = walk(p->pagetable, va, 0);
+    uint flags;
+    uint8 pgrefcnt;
+    char *mem = 0;
+    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
+      // printf("usertrap(): get pte for COW failed, pte must exist and be valid\n");
+      p->killed = 1;
+      goto kill;
+    }
+    if ((*pte & PTE_COW) == 0) {
+      // printf("usertrap(): not a COW page\n");
+      p->killed = 1;
+      goto kill;
+    }
+
+    ppa = PTE2PA(*pte); // physical page address
+    flags = PTE_FLAGS(*pte);
+    flags = flags | PTE_W; // mark writable
+    flags = flags & ~PTE_COW; // reset COW bit
+    
+    pgrefcnt = getpgcnt(ppa);
+    if (pgrefcnt > 1) { // need a new page
+      if ((mem = kalloc()) == 0) {
+        // printf("usertrap(): allocate page error\n");
+        p->killed = 1;
+        goto kill;
+      }
+      memmove(mem, (char *)ppa, PGSIZE);
+      decpgcnt(ppa, 1);
+      ppa = (uint64)mem;
+    }
+    
+    *pte = (*pte) & ~PTE_V; // allow for remap
+    if (mappages(p->pagetable, vpa, PGSIZE, ppa, flags) != 0) {
+      *pte = (*pte) | PTE_V; // remove remap
+      // printf("usertrap(): page map error\n");
+      if (mem)
+        kfree(mem);
+      p->killed = 1;
+      goto kill;
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
   }
 
+ kill:
   if(p->killed)
     exit(-1);
 

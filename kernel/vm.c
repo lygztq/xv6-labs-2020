@@ -291,6 +291,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
+// [COW version]
 // Given a parent process's page table, copy
 // its memory into a child's page table.
 // Copies both the page table and the
@@ -299,6 +300,44 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // frees any allocated pages on failure.
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walk(old, i, 0)) == 0)
+      panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    
+    // mark parent's PTE read-only and set COW bit
+    *pte = (*pte) & ~PTE_W;
+    *pte = (*pte) | PTE_COW;
+
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+      goto err;
+    }
+    incpgcnt(pa, 1);
+  }
+  return 0;
+
+ err:
+  uvmunmap(new, 0, i / PGSIZE, 1);
+  return -1;
+}
+
+// [Deprecated]
+// Given a parent process's page table, copy
+// its memory into a child's page table.
+// Copies both the page table and the
+// physical memory.
+// returns 0 on success, -1 on failure.
+// frees any allocated pages on failure.
+int
+duvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
@@ -347,12 +386,51 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
+  uint flags;
+  char *mem = 0;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    // first check this va is valid
+    if (!validva(va0)) {
+      return -1;
+    }
+
     pa0 = walkaddr(pagetable, va0);
+    pte = walk(pagetable, va0, 0);
+    if(pte==0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+    pa0 = PTE2PA(*pte);
     if(pa0 == 0)
       return -1;
+
+    flags = PTE_FLAGS(*pte);
+    // cow page
+    if (((*pte & PTE_COW) != 0) && ((*pte & PTE_W) == 0)) {
+      flags = flags | PTE_W;
+      flags = flags & ~PTE_COW;
+
+      if (getpgcnt(pa0) > 1) {
+        // need copy
+        if ((mem = kalloc()) == 0) {
+          return -1;
+        }
+        memmove(mem, (char *)pa0, PGSIZE); // this is important, you should keep the original contents if you only modify part of a page.
+        decpgcnt(pa0, 1);
+        pa0 = (uint64)mem;
+      }
+
+      *pte = (*pte) & ~PTE_V; // allow for remap
+      if (mappages(pagetable, va0, PGSIZE, pa0, flags) != 0) {
+        if (mem)
+          kfree(mem);
+        *pte = (*pte) | PTE_V;
+        return -1;
+      }
+    }
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -431,4 +509,11 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+int validva(uint64 va) {
+  if (va >= MAXVA) {
+    return 0;
+  }
+  return 1;
 }
