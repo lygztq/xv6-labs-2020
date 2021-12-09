@@ -1,0 +1,18 @@
+Suppose T1 and T2 are updating the same bucket.
+l: the linklist of that bucket.
+
+|         T1          |         T2          |
+|-------------------------------------------|
+| create new entry e1 |                     |
+|                     | create new entry e2 |
+| e1->next = l        |                     |
+|                     | e2->next = l        |
+| l = e1              |                     |
+|                     | l = e2              |
+
+
+e1
+   \loss
+     l -> ...
+   /
+e2[new l]
