@@ -1,0 +1,20 @@
+1. 死锁问题
+e1000_recv 不加锁，处理完一个 recv 前，下一个 recv 会被阻塞住。如果
+和 e1000_transmit 用同一把锁，如果 recv 接收到一个 arp 包，会在 recv
+内部发送 arp 回包，从而调用 e1000_transmit，两者用同一把锁就死锁了。
+
+2. multi-process ping 阻塞
+这里就是不处理 assignment 描述中说的
+"
+At some point the total number of packets that have ever arrived
+will exceed the ring size (16); make sure your code can handle that.
+"
+会产生的问题
+仔细看文档的话就会发现 rx_ring 满的时候 (Head == Tail) NIC 默认就不再
+往 memory 里面传输了（这个时候如果 PHY 的 on-chip buffer 也满了就开始
+丢包了，不过这个不重要），而 Head 的增长是 NIC 管理的，和中断无关，如果
+我们在中断中刚刚好处理完一个packet，修改了 Tail 使其前进一个，而这个时候
+NIC 让 Head 直接增长到了 Tail 的为止 （打满了），之后就会陷入 NIC 认为
+buffer 满了但是 CPU 收不到中断的僵局（因为一开始设置的时候禁止了 NIC 的
+abs timer 而启用了一个 packet 一个中断的模式），所以这里要使用 while
+循环让 CPU 和 NIC 赛跑，直到 NIC 传完为止。
