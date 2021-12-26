@@ -23,32 +23,91 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
-  struct spinlock lock;
-  struct buf buf[NBUF];
+extern struct spinlock tickslock;
+extern uint ticks;
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+// buffer bin
+struct bbin {
+  struct spinlock lock;
+  struct buf* head;
+  int allocing;
+  char name[9];
+};
+
+// Detach a buffer from a bin's list.
+// Caller should hold the bin, and b is not in use.
+// Note: b must in bin
+inline void
+detach_buf(struct bbin* bin, struct buf* b) {
+  if (b->refcnt != 0)
+    panic("detach_buf");
+  
+  // if is head
+  if (b == bin->head)
+    bin->head = b->next;
+
+  if (b->prev)
+    b->prev->next = b->next;
+  if (b->next)
+    b->next->prev = b->prev;
+  b->next = 0;
+  b->prev = 0;
+}
+
+// Insert a buffer into bin
+// Caller should hold the bin (except for binit), and b must not belong to any bin.
+// Note: buf must not in bin
+inline void
+insert_bbin(struct bbin* bin, struct buf* b) {
+  b->next = bin->head;
+  if (bin->head) {
+    bin->head->prev = b;
+  }
+  b->prev = 0;
+  bin->head = b;
+}
+
+// Pop the least recently used buffer from bin.
+// Caller should hold bin
+struct buf*
+pop_bbin(struct bbin* bin) {
+  struct buf* ptr = bin->head;
+  struct buf* topop = 0;
+  uint min_tick = 0;
+
+  while (ptr) {
+    if (ptr->refcnt == 0 && (ptr->tick < min_tick || !topop)) {
+      topop = ptr;
+      min_tick = ptr->tick;
+    }
+    ptr = ptr->next;
+  }
+  if (topop)
+    detach_buf(bin, topop);
+  return topop;
+}
+
+struct {
+  struct buf buf[NBUF];
+  struct bbin bufbins[NBUFBIN];
 } bcache;
 
 void
 binit(void)
 {
-  struct buf *b;
+  struct bbin* cbin;
+  int bufperbin = NBUF / NBUFBIN;
+  for (int i = 0; i < NBUFBIN; ++i) {
+    cbin = &(bcache.bufbins[i]);
+    snprintf(cbin->name, sizeof(cbin->name), "bcache_%d", i);
+    initlock(&cbin->lock, cbin->name);
+    cbin->allocing = 0;
 
-  initlock(&bcache.lock, "bcache");
-
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    int end_bufid = (i == (NBUFBIN - 1)) ? NBUF : (i + 1) * bufperbin;
+    for (int bufid = i * bufperbin; bufid < end_bufid; ++bufid) {
+      initsleeplock(&bcache.buf[bufid].lock, "buffer");
+      insert_bbin(cbin, &bcache.buf[bufid]);
+    }
   }
 }
 
@@ -59,31 +118,56 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
+  struct bbin *bin;
+  uint binid = blockno % NBUFBIN;
+  bin = &(bcache.bufbins[binid]);
 
-  acquire(&bcache.lock);
+  acquire(&tickslock);
+  uint ctick = ticks;
+  release(&tickslock);
+
+  acquire(&bin->lock);
+  while (bin->allocing) sleep(bin, &bin->lock);
 
   // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
+  for(b = bin->head; b; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
       b->refcnt++;
-      release(&bcache.lock);
+      b->tick = ctick;
+      release(&bin->lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
 
   // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
+  bin->allocing = 1;
+  release(&bin->lock);
+  do {
+    acquire(&bin->lock);
+    b = pop_bbin(bin);
+    release(&bin->lock);
+    if (b) break;
+    bin = bin + 1;
+    if (bin == ((struct bbin*)bcache.bufbins + NBUFBIN))
+      bin = (struct bbin*)bcache.bufbins;
+  } while (bin != &(bcache.bufbins[binid]));
+
+  bin = &bcache.bufbins[binid];
+  if (b) {
+    // now b is detached from all bins
+    b->dev = dev;
+    b->blockno = blockno;
+    b->valid = 0;
+    b->refcnt = 1;
+    b->tick = ctick;
+    acquire(&bin->lock);
+    insert_bbin(bin, b);
+    bin->allocing = 0;
+    wakeup(bin);
+    release(&bin->lock);
+    acquiresleep(&b->lock);
+    return b;
   }
   panic("bget: no buffers");
 }
@@ -116,38 +200,38 @@ bwrite(struct buf *b)
 void
 brelse(struct buf *b)
 {
+  struct bbin *bin;
+  uint binid = b->blockno % NBUFBIN;
+  bin = &bcache.bufbins[binid];
+
   if(!holdingsleep(&b->lock))
     panic("brelse");
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  acquire(&bin->lock);
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  release(&bin->lock);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  struct bbin *bin;
+  uint binid = b->blockno % NBUFBIN;
+  bin = &bcache.bufbins[binid];
+
+  acquire(&bin->lock);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bin->lock);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  struct bbin *bin;
+  uint binid = b->blockno % NBUFBIN;
+  bin = &bcache.bufbins[binid];
+
+  acquire(&bin->lock);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bin->lock);
 }
-
-
