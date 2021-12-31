@@ -5,7 +5,11 @@
 #include "param.h"
 #include "memlayout.h"
 #include "spinlock.h"
+#include "sleeplock.h"
 #include "proc.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 uint64
 sys_exit(void)
@@ -94,4 +98,63 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+extern int argfd(int n, int *pfd, struct file **pf);
+uint64
+sys_mmap(void)
+{
+  struct proc *p = myproc();
+  struct vma *vmap;
+  struct file *f;
+  uint64 uaddr;
+  int len, offset, prot, flags;
+
+  if (argaddr(0, &uaddr) < 0 || argint(1, &len) < 0 ||
+      argint(2, &prot) < 0 || argint(3, &flags) < 0 ||
+      argfd(4, 0, &f) < 0 || argint(5, &offset) < 0) {
+    return -1;
+  }
+  len = PGROUNDUP(len);
+
+  // 1. should be able to map file opened read-only with private writable
+  // 2. doesn't allow read/write mapping of a file opened read-only.
+  if ((!f->readable && (prot & PROT_READ)) ||
+      (!f->writable && (prot & PROT_WRITE) && (flags & MAP_SHARED)) ||
+      f->type != FD_INODE)
+    return -1;
+
+  // find a available vma in this proc
+  for (vmap = &p->vmas[0]; vmap != &p->vmas[MAX_NVMA]; vmap++) {
+    if (vmap->valid) continue;
+    vmap->valid = 1;
+    vmap->length = len;
+    vmap->perm = prot;
+    vmap->sharem = flags;
+    vmap->f = filedup(f);
+    vmap->basefileoff = 0;
+    mmap(p->pagetable, vmap);
+    break;
+  }
+  if (vmap == &p->vmas[MAX_NVMA])
+    return -1;
+
+  return vmap->addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 uaddr;
+  int len;
+
+  if (argaddr(0, &uaddr) < 0 || argint(1, &len) < 0)
+    return -1;
+
+  uaddr = PGROUNDDOWN(uaddr);
+  len = PGROUNDUP(uaddr + len) - uaddr;
+  if (munmap(uaddr, len) < 0)
+    return -1;
+  
+  return 0;
 }

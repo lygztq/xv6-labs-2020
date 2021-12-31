@@ -338,11 +338,13 @@ sfence_vma()
 #define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
 #define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
 
-#define PTE_V (1L << 0) // valid
-#define PTE_R (1L << 1)
-#define PTE_W (1L << 2)
-#define PTE_X (1L << 3)
-#define PTE_U (1L << 4) // 1 -> user can access
+#define PTE_V     (1L << 0) // valid
+#define PTE_R     (1L << 1)
+#define PTE_W     (1L << 2)
+#define PTE_X     (1L << 3)
+#define PTE_U     (1L << 4) // 1 -> user can access
+#define PTE_D     (1L << 7) // dirty bit
+#define PTE_LZLD  (1L << 8) // lazy load for mmap
 
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)

@@ -289,6 +289,14 @@ fork(void)
   }
   np->sz = p->sz;
 
+  // copy vmas
+  for (i = 0; i < MAX_NVMA; ++i) {
+    if (p->vmas[i].valid) {
+      np->vmas[i] = p->vmas[i];
+      filedup(p->vmas[i].f);
+    }
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -343,6 +351,13 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // unmap all vmas
+  struct vma *vmap;
+  for (vmap = &p->vmas[0]; vmap != &p->vmas[MAX_NVMA]; ++vmap) {
+    if (vmap->valid)
+      munmap(vmap->addr, vmap->length); 
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

@@ -80,6 +80,18 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
+// virtual memory area
+#define MAX_NVMA 16
+struct vma {
+  uint64 addr;            // starting address
+  uint64 length;          // the actural length, use PGROUNDUP to get the page length
+  uint64 basefileoff;     // the offset of addr in the mapping file
+  uint8 perm;             // permissions
+  uint8 sharem;           // shared or private
+  uint8 valid;            // in use or not
+  struct file *f;         // file ptr associated to it
+};
+
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
 // Per-process state
@@ -104,5 +116,6 @@ struct proc {
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
+  struct vma vmas[MAX_NVMA];         // Virtual memory areas
   char name[16];               // Process name (debugging)
 };

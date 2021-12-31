@@ -4,7 +4,12 @@
 #include "elf.h"
 #include "riscv.h"
 #include "defs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
 #include "fs.h"
+#include "file.h"
+#include "proc.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -303,7 +308,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  char *mem = (char*)-1;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -312,11 +317,14 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
+    if (!(flags & PTE_LZLD)) {
+      if((mem = kalloc()) == 0)
+        goto err;
+      memmove(mem, (char*)pa, PGSIZE);
+    }
     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+      if (!(flags & PTE_LZLD))
+        kfree(mem);
       goto err;
     }
   }
@@ -338,6 +346,175 @@ uvmclear(pagetable_t pagetable, uint64 va)
   if(pte == 0)
     panic("uvmclear");
   *pte &= ~PTE_U;
+}
+
+// A recursive function that looks for free interval for mmap with a given length(len).
+// base is the base address, ptesize is the size of pte in this page table level. If fromhead
+// is set, looking for interval starting from the head of this page table.
+// Return the start address of the found interval, and return length of this interval in rlen,
+// the found interval may not have enough length as len.
+static uint64
+lookahead(pagetable_t pgtbl, uint64 base, uint64 len, uint64 ptesize, int fromhead, uint64 *rlen) {
+  int i = 0;
+  uint64 start = 0, currlen = 0, nstart, nlen;
+  // there are 2^9 = 512 PTEs in a page table.
+  while (i < 512) {
+    pte_t pte = pgtbl[i];
+    currlen = ptesize * i - start;
+    if (currlen >= len) {
+      *rlen = len;
+      return start;
+    }
+
+    // if this PTE points to a lower-level page table
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0) {
+      uint64 child = PTE2PA(pgtbl[i]);
+      
+      // case: [--s..][.s+l--], (. for free)
+      lookahead((pagetable_t)child, 0, len - currlen, ptesize / 512, 1, &nlen);
+      if (nlen >= (len - currlen)) {
+        *rlen = len;
+        return start + base;
+      }
+
+      // empty pte (but not null)
+      if (nlen == ptesize) {
+        ++i;
+        continue;
+      }
+      
+      // this pte is not empty
+      // need to find a new start
+      if (fromhead) {
+        *rlen = 0;
+        return 0;
+      }
+      nstart = lookahead((pagetable_t)child, ptesize * i, len, ptesize / 512, 0, &nlen);
+      
+      // if next pte has enough free space
+      if (nlen == len) {
+        *rlen = len;
+        return nstart + base;
+      }
+      
+      // if not, restart from the new start
+      start = nstart;
+      continue;
+    } else if (pte & PTE_V) { // a leaf pte
+      if (fromhead) { // not find
+        *rlen = 0;
+        return 0;
+      } else {        // jump to the next free pte
+        while ((pgtbl[i] & PTE_V) && i < 512) ++i;
+        if (i == 512) {
+          *rlen = 0;
+          return i * ptesize + base;
+        } else {
+          start = i * ptesize;
+          continue;
+        }
+      }
+    }
+    ++i;
+  }
+
+  *rlen = i * ptesize - start;
+  return start + base;
+}
+
+// find a free interval in vm for mmap
+// len may not be page-aligned.
+uint64
+mmapfind(pagetable_t pgtbl, uint64 len) {
+  uint64 saddr = 0;         // start address
+  uint64 ptesize = 512 * 512 * PGSIZE, flen;
+
+  saddr = lookahead(pgtbl, 0, len, ptesize, 0, &flen);
+  
+  if (flen < len)
+    panic("mmapfind: no enough memory for mmap");
+
+  return saddr;
+}
+
+uint64
+mmap(pagetable_t pgtbl, struct vma* vmap) {
+  uint64 startva, a;
+  pte_t *pte;
+  struct proc *p = myproc();
+  startva = mmapfind(pgtbl, vmap->length);
+  vmap->addr = startva;
+
+  // just mark these ptes
+  for (a = startva; a < startva + vmap->length; a += PGSIZE) {
+    pte = walk(pgtbl, a, 1);
+    *pte = *pte & (~PTE_R) & (~PTE_W) & (~PTE_X);
+    *pte = *pte | PTE_U | PTE_V | PTE_LZLD;
+  }
+  if (startva + vmap->length > p->sz) {
+    p->sz = startva + vmap->length;
+  }
+  return startva;
+}
+
+struct vma* findvma(uint64 va) {
+  struct proc *p = myproc();
+  struct vma *vp;
+  for (vp = &p->vmas[0]; vp != &p->vmas[MAX_NVMA]; ++vp) {
+    if (!vp->valid) continue;
+    if (va >= vp->addr && va < (vp->addr + vp->length)) {
+      return vp;
+    }
+  }
+  return 0;
+}
+
+// saddr and len must be page-aligned
+int munmap(uint64 saddr, uint64 len) {
+  struct proc *p = myproc();
+  struct vma *vmap;
+  pte_t *pte;
+  if ((vmap = findvma(saddr)) == 0)
+    return -1;
+
+  // write back
+  if (vmap->sharem & MAP_SHARED) {
+    uint woff, wlen; 
+    begin_op();
+    ilock(vmap->f->ip);
+    for (uint64 va = saddr; va < saddr + len; va += PGSIZE) {
+      pte = walk(p->pagetable, va, 0);
+      if (*pte & PTE_D) {
+        woff = vmap->basefileoff + (va - vmap->addr);
+        wlen = (woff + PGSIZE > vmap->f->ip->size) ? vmap->f->ip->size - woff : PGSIZE;
+        writei(vmap->f->ip, 1, va, woff, wlen);
+      }
+    }
+    iunlock(vmap->f->ip);
+    end_op();
+  }
+
+  // unmap pages
+  if (saddr == vmap->addr) {
+    vmap->addr = saddr + len;
+    vmap->basefileoff += len;
+  }
+  vmap->length -= len;
+  p->sz -= len;
+
+  for (uint64 va = saddr; va < saddr + len; va += PGSIZE) {
+    if ((pte = walk(p->pagetable, va, 0)) == 0)
+      panic("munmap: walk");
+    uvmunmap(p->pagetable, va, 1, !(*pte & PTE_LZLD));
+  }
+
+  // release vma and file
+  if (vmap->length == 0) {
+    fileclose(vmap->f);
+    vmap->valid = 0;
+  }
+
+  return 0;
 }
 
 // Copy from kernel to user.

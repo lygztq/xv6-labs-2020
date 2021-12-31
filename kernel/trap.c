@@ -3,8 +3,12 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
+#include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -67,12 +71,77 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (r_scause() == 12 || r_scause() == 13 || r_scause() == 15) {
+    // exec/load/store page fault
+    uint64 addr = r_stval(), cause = r_scause();
+
+    // check valid address
+    if (addr >= MAXVA) {
+      p->killed = 1;
+      goto utrap_finish;
+    }
+
+    pte_t *pte = walk(p->pagetable, addr, 0);
+    uint flags;
+    struct vma* vmap;
+
+    // check if this is a lazy load page
+    // check if this is a valid user address
+    // check if this page is accessible
+    if (!pte || !(*pte & PTE_LZLD) || !(*pte & PTE_U) || !(*pte & PTE_V)) {
+      p->killed = 1;
+      goto utrap_finish;
+    }
+
+    // find the corresponding vma
+    if ((vmap = findvma(addr)) == 0) {
+      p->killed = 1;
+      goto utrap_finish;
+    }
+
+    // check permission
+    if (vmap->perm & PROT_NONE) {
+      p->killed = 1;
+      goto utrap_finish;
+    }
+
+    if ((cause == 12 && (vmap->perm & PROT_EXEC)) ||
+        (cause == 13 && (vmap->perm & PROT_READ)) ||
+        (cause == 15 && (vmap->perm & PROT_WRITE))) {
+      flags = PTE_FLAGS(*pte);
+      flags = flags | (vmap->perm << 1);
+      flags = flags & ~PTE_LZLD;
+
+      char *newpa;
+      if ((newpa = kalloc()) == 0) {
+        p->killed = 1;
+        goto utrap_finish;
+      }
+      *pte = *pte & ~PTE_V; // allow for remap
+      if (mappages(p->pagetable, addr, PGSIZE, (uint64)newpa, flags) != 0) {
+        *pte = *pte | PTE_V; // remove remap
+        if (newpa)
+          kfree(newpa);
+        p->killed = 1;
+        goto utrap_finish;
+      }
+
+      // load file
+      memset(newpa, 0, PGSIZE);
+      ilock(vmap->f->ip);
+      readi(vmap->f->ip, 1, addr, addr - vmap->addr, PGSIZE);
+      iunlock(vmap->f->ip);
+    } else {
+      p->killed = 1;
+      goto utrap_finish;
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
   }
 
+utrap_finish:
   if(p->killed)
     exit(-1);
 

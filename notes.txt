@@ -1,0 +1,7 @@
+坑
+* 在 mmap 和 munmap 的过程中注意 proc->sz 也要同时改变，不然会在 fork 和 exit（主要是 free pagetable）的时候出现大问题
+  而且 xv6 的user memory space 从下到上是连续的（除了上面那几个 page），但是这里实现 munmap 的时候就会出现空洞，这个就很
+  难受
+* 注意 PTE flag bit 的设置，尤其是 PTE_U
+* uvmcopy 中记得检查是否是一个 lazy alloc 的 page，尤其是 fork 的时候
+* 注意非法addr的检查（例如MAXVA+1 和 0x0）
